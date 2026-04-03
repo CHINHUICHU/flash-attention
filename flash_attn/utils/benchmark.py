@@ -42,10 +42,12 @@ def benchmark_backward(
     if verbose:
         print(desc, "- Backward pass")
     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp):
+        # run the forward pass
         y = fn(*inputs, **kwinputs)
         if type(y) is tuple:
             y = y[0]
     if grad is None:
+        # generate a random gradient
         grad = torch.randn_like(y)
     else:
         if grad.shape != y.shape:
@@ -58,6 +60,7 @@ def benchmark_backward(
                 x.grad = None
         y.backward(grad, retain_graph=True)
 
+    # only measure the backward pass
     t = benchmark.Timer(
         stmt="f(*inputs, y=y, grad=grad)",
         globals={"f": f, "inputs": inputs, "y": y, "grad": grad},
