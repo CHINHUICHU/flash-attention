@@ -1,22 +1,29 @@
+# Changes from the original script:
+#   - Replaced `triton.ops.flash_attention` with our local `flash_attn_triton_og` (renamed to TritonOG).
+#     TritonOG only supports causal=True, so non-causal configs now record NaN instead of being attempted.
+#     The old Triton block ran both sequence_parallel={False,True} and picked the faster backward;
+#     the new block simply calls attention_triton_og with a single scale argument.
+#   - Removed unused imports (pickle, torch.nn, repeat, benchmark_all, benchmark_forward, benchmark_backward).
+#   - Added explanatory comments inside flops() for the FLOP formula and backward multipliers.
+#   - Print format now shows latency in ms alongside TFLOPs/s (was TFLOPs/s only).
+#   - Removed the dead pickle dump at the end.
+#
 # Install the newest triton version with
 # pip install "git+https://github.com/openai/triton.git#egg=triton&subdirectory=python"
-import pickle
 import math
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
-from einops import rearrange, repeat
+from einops import rearrange
 
-from flash_attn.utils.benchmark import benchmark_all, benchmark_forward, benchmark_backward
-from flash_attn.utils.benchmark import benchmark_fwd_bwd, benchmark_combined
+from flash_attn.utils.benchmark import benchmark_fwd_bwd
 
 from flash_attn import flash_attn_qkvpacked_func
 
 try:
-    from triton.ops.flash_attention import attention as attention_triton
+    from flash_attn.flash_attn_triton_og import attention as attention_triton_og
 except ImportError:
-    attention_triton = None
+    attention_triton_og = None
 
 try:
     import xformers.ops as xops
@@ -26,7 +33,13 @@ except ImportError:
 
 def flops(batch, seqlen, headdim, nheads, causal, mode="fwd"):
     assert mode in ["fwd", "bwd", "fwd_bwd"]
+    # 2 matmuls (QK^T and PV), each 2*B*S^2*H*D FLOPs => 4*B*S^2*H*D total.
+    # Softmax FLOPs (3*B*H*S^2) are excluded — negligible vs matmuls at large S and D.
+    # Causal masking halves the work (roughly half the attention matrix is computed).
     f = 4 * batch * seqlen**2 * nheads * headdim // (2 if causal else 1)
+    # 2.5x and 3.5x are rough empirical multipliers, not exact derivations.
+    # Backward requires dQ, dK, dV (each ~1 fwd matmul) plus softmax backward overhead,
+    # which lands around 2.5x fwd in practice.
     return f if mode == "fwd" else (2.5 * f if mode == "bwd" else 3.5 * f)
 
 def efficiency(flop, time):
@@ -78,7 +91,7 @@ dim = 2048
 dropout_p = 0.0
 
 methods = (["Flash2", "Pytorch"]
-           + (["Triton"] if attention_triton is not None else [])
+           + (["TritonOG"] if attention_triton_og is not None else [])
            + (["xformers.c"] if xops is not None else [])
            + (["xformers.f"] if xops is not None else []))
 
@@ -121,27 +134,23 @@ for causal in causal_vals:
                 time_f[config, "Pytorch"] = f
                 time_b[config, "Pytorch"] = b
 
-            # Triton
-            if "Triton" in methods and attention_triton is not None:
-                q, k, v = [torch.randn(batch_size, nheads, seqlen, headdim,
-                                       device=device, dtype=dtype, requires_grad=True) for _ in range(3)]
-                # Try both values of sequence_parallel and pick the faster backward
-                try:
-                    f, b = time_fwd_bwd(
-                        attention_triton, q, k, v, causal, headdim**(-0.5),
-                        False, repeats=repeats, verbose=False
-                    )
-                except Exception:
-                    f, b = float('nan'), float('inf')
-                try:
-                    _, b0 = time_fwd_bwd(
-                        attention_triton, q, k, v, causal, headdim**(-0.5),
-                        True, repeats=repeats, verbose=False
-                    )
-                except Exception:
-                    b0 = float('inf')
-                time_f[config, "Triton"] = f
-                time_b[config, "Triton"] = min(b, b0) if min(b, b0) < float('inf') else float('nan')
+            # Triton OG (always causal — skip non-causal configs)
+            if "TritonOG" in methods and attention_triton_og is not None:
+                if not causal:
+                    time_f[config, "TritonOG"] = float('nan')
+                    time_b[config, "TritonOG"] = float('nan')
+                else:
+                    q, k, v = [torch.randn(batch_size, nheads, seqlen, headdim,
+                                           device=device, dtype=dtype, requires_grad=True) for _ in range(3)]
+                    try:
+                        f, b = time_fwd_bwd(
+                            attention_triton_og, q, k, v, headdim**(-0.5),
+                            repeats=repeats, verbose=False
+                        )
+                    except Exception:
+                        f, b = float('nan'), float('nan')
+                    time_f[config, "TritonOG"] = f
+                    time_b[config, "TritonOG"] = b
 
             # xFormers CUTLASS
             if "xformers.c" in methods and xops is not None:
@@ -186,10 +195,8 @@ for causal in causal_vals:
                     time_f_b[config, method]
                 )
                 print(
-                    f"{method} fwd: {speed_f[config, method]:.2f} TFLOPs/s, "
-                    f"bwd: {speed_b[config, method]:.2f} TFLOPs/s, "
-                    f"fwd + bwd: {speed_f_b[config, method]:.2f} TFLOPs/s"
+                    f"{method} "
+                    f"fwd: {time_f[config, method]*1e3:.3f}ms ({speed_f[config, method]:.2f} TFLOPs/s), "
+                    f"bwd: {time_b[config, method]*1e3:.3f}ms ({speed_b[config, method]:.2f} TFLOPs/s), "
+                    f"fwd+bwd: {time_f_b[config, method]*1e3:.3f}ms ({speed_f_b[config, method]:.2f} TFLOPs/s)"
                 )
-
-# with open('flash2_attn_time.plk', 'wb') as fp:
-#     pickle.dump((speed_f, speed_b, speed_f_b), fp, protocol=pickle.HIGHEST_PROTOCOL)

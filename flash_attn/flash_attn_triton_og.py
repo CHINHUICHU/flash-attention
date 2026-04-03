@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-
+# No L2 Cache Optimization
 @triton.jit
 def _fwd_kernel(
     Q,
@@ -74,7 +74,7 @@ def _fwd_kernel(
         # -- compute qk ----
         k = tl.load(k_ptrs + start_n * stride_kn)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k, trans_b=True)
+        qk += tl.dot(q, tl.trans(k))
         qk *= sm_scale
         qk += tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), 0, float("-inf"))
         # -- compute m_ij, p, l_ij
@@ -215,21 +215,21 @@ def _bwd_kernel(
             q = tl.load(q_ptrs)
             # recompute p = softmax(qk, dim=-1).T
             # NOTE: `do` is pre-divided by `l`; no normalization here
-            qk = tl.dot(q, k, trans_b=True)
+            qk = tl.dot(q, tl.trans(k))
             qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
             m = tl.load(m_ptrs + offs_m_curr)
             p = tl.exp(qk * sm_scale - m[:, None])
             # compute dv
             do = tl.load(do_ptrs)
-            dv += tl.dot(p.to(do.dtype), do, trans_a=True)
+            dv += tl.dot(tl.trans(p.to(do.dtype)), do)
             # compute dp = dot(v, do)
             Di = tl.load(D_ptrs + offs_m_curr)
             dp = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32) - Di[:, None]
-            dp += tl.dot(do, v, trans_b=True)
+            dp += tl.dot(do, tl.trans(v))
             # compute ds = p * (dp - delta[:, None])
             ds = p * dp * sm_scale
             # compute dk = dot(ds.T, q)
-            dk += tl.dot(ds.to(q.dtype), q, trans_a=True)
+            dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
             # # compute dq
             dq = tl.load(dq_ptrs, eviction_policy="evict_last")
             dq += tl.dot(ds.to(k.dtype), k)
